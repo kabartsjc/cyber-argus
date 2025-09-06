@@ -1,0 +1,4 @@
+pip install pyopengl
+pip install PyQt6
+pip install paho-mqtt requests
+pip install RTree
