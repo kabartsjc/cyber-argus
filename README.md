@@ -12,7 +12,7 @@
    cd bluesky
    python BlueSky.py
 
-   #if does not work
-   python BlueSky_pygame.py
-6) Change the configuration file to start in the desired place (/home/kabart/github/cyber-argus/bluesky/settings.cfg)
-   start_location = 'SBRJ'
+#if does not work
+python BlueSky_pygame.py
+7) Change the configuration file to start in the desired place (/home/kabart/github/cyber-argus/bluesky/settings.cfg)
+start_location = 'SBRJ'
