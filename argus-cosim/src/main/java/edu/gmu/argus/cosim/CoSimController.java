@@ -1,82 +1,74 @@
 package edu.gmu.argus.cosim;
 
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
-import jakarta.annotation.PostConstruct;
-import java.time.Instant;
+
+import edu.gmu.argus.model.Track;
+import edu.gmu.argus.model.TrackStateMessage;
+
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 
 @RestController
-@RequestMapping("/cosim")
+@RequestMapping("/api/fed")
 public class CoSimController {
 
-    private final Set<String> registeredFederates = new HashSet<>();
-    private final Map<Integer, Set<String>> tickAcks = new ConcurrentHashMap<>();
-    private int currentTime = 0;
-    private final int federateJoinTimeoutSeconds = 15; // time to wait before simulation starts
-    private Instant startTime;
-    private boolean registrationWindowClosed = false;
+	private final Map<String, Federate> fed = new ConcurrentHashMap<>();
+	private final AtomicReference<Double> currentTime = new AtomicReference<>(0.0);
+	// If you orchestrate multiple federates, gate grants until all are ready for
+	// the next barrier.
+	private final double lookahead = 0.1; // seconds
+	private final double macroStep = 1.0; // grant in 1s slices, adjust as needed
 
-    @PostConstruct
-    public void init() {
-        startTime = Instant.now();
-        System.out.println("Server started. Waiting for federates to register...");
-    }
+	@PostMapping("/register")
+	public Map<String, Object> register(@RequestBody Map<String, Object> req) {
+		String name = (String) req.getOrDefault("name", "unnamed");
+		String id = UUID.randomUUID().toString();
+		fed.put(id, new Federate(id, name));
+		return Map.of("federateId", id, "simStart", currentTime.get(), "simDt", 0.1);
+	}
 
-    @PostMapping("/register")
-    public String register(@RequestParam String name) {
-        registeredFederates.add(name);
-        System.out.println("Federate registered: " + name);
-        return "Registered: " + name;
-    }
-    
-    
-    @PostMapping("/ack")
-    public String ack(@RequestParam String name, @RequestParam int tick) {
-        tickAcks.computeIfAbsent(tick, k -> new HashSet<>()).add(name);
-        return "Ack received from " + name + " for tick " + tick;
-    }
+	@PostMapping("/requestTime")
+	public synchronized Map<String, Object> requestTime(@RequestBody Map<String, Object> req) {
+		String id = (String) req.get("federateId");
+		double requestTime = ((Number) req.get("requestTime")).doubleValue();
 
-    @GetMapping("/tick")
-    public synchronized Map<String, Object> tick() {
-        Instant now = Instant.now();
-        Set<String> currentAcks = tickAcks.getOrDefault(currentTime, new HashSet<>());
-        System.out.println("Tick: " + currentTime + " ACKs so far: " + currentAcks);
+		// Simple policy: grant at most currentTime + macroStep - lookahead
+		double safeLimit = currentTime.get() + macroStep - lookahead;
+		double grant = Math.min(requestTime, safeLimit);
 
-        // Close registration window after timeout
-        if (!registrationWindowClosed) {
-            long elapsed = now.getEpochSecond() - startTime.getEpochSecond();
-            if (elapsed >= federateJoinTimeoutSeconds) {
-                registrationWindowClosed = true;
-                System.out.println("Federate join window closed. Registered: " + registeredFederates);
-            } else {
-                return Map.of(
-                    "time", currentTime,
-                    "status", "waiting for federates to join",
-                    "remaining", federateJoinTimeoutSeconds - elapsed
-                );
-            }
-        }
+		// Barrier: if you have N federates, track their lastGrant and only advance
+		// currentTime when all have reached 'grant'. For a single federate, you can do:
+		currentTime.set(Math.max(currentTime.get(), grant));
+		fed.get(id).setLastGrant(grant);
 
-        // Wait for all federates to acknowledge current tick
-        if (!allAcknowledged(currentTime)) {
-            return Map.of("time", currentTime, "status", "waiting for acknowledgments");
-        }
+		return Map.of("grantTime", grant);
+	}
 
-        // Advance time
-        currentTime++;
-        tickAcks.put(currentTime, new HashSet<>());
+	@PostMapping("/trackstate")
+	public ResponseEntity<Void> state(@RequestBody TrackStateMessage state) {
+		System.out.println("Received state at time " + state.getTime() + " from federate " + state.getFederateId());
 
-        return Map.of("time", currentTime, "status", "ok");
-    }
+		for (Track track : state.getTracks()) {
+			System.out.println(track);
+		}
 
-    @GetMapping("/federates")
-    public Set<String> federates() {
-        return registeredFederates;
-    }
+		return ResponseEntity.ok().build();
+	}
 
-    private boolean allAcknowledged(int tick) {
-        return tickAcks.getOrDefault(tick, new HashSet<>()).containsAll(registeredFederates);
-    }
+	static class Federate {
+		final String id;
+		final String name;
+		volatile double lastGrant = 0.0;
+
+		Federate(String id, String name) {
+			this.id = id;
+			this.name = name;
+		}
+
+		void setLastGrant(double g) {
+			this.lastGrant = g;
+		}
+	}
 }
-

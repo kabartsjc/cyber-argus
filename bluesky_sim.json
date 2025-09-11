@@ -1,0 +1,5 @@
+{
+  "scenario": "brt_scen8",
+  "name": "bluesky-federate",
+  "server": "http://localhost:8080"
+}

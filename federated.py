@@ -1,4 +1,4 @@
-import paho.mqtt.client as mqtt
+from abc import abstractmethod
 import requests
 import time
 import json
@@ -7,62 +7,43 @@ import logging
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] %(message)s')
 
 class Federated:
-    def __init__(self, name, broker="localhost", server="http://localhost:8080", topic_prefix="cosim"):
+    def __init__(self, name,server="http://localhost:8080"):
         self.name = name
-        self.broker = broker
         self.server = server
-        self.topic = f"{topic_prefix}/{self.name}"
-        self.client = mqtt.Client()
-        self.client.connect(self.broker, 1883, 60)
         self.last_tick = -1
+        self.SIMDT  = 0.1                      # internal BlueSky integrator step (s)
+        self.MACRO  = 1.0                      # how much we try to advance per grant (s)
         self.active = True
 
     def register(self):
-        r = requests.post(f"{self.server}/cosim/register", params={"name": self.name})
-        logging.info(f"[Federated:{self.name}] {r.text}")
+        r = requests.post(f"{self.server}/api/fed/register",
+                      json={"name": self.name, "capabilities":["state.publish"], "lookahead": self.SIMDT})
+        
+        r.raise_for_status()
+        data = r.json()
 
-    def run(self, timeout=None):
-        self.register()
-        while self.active:
-            try:
-                r = requests.get(f"{self.server}/cosim/tick", timeout=timeout)
-                response = r.json()
-                current_tick = response["time"]
-                status = response["status"]
+        logging.info(f"[Federated:{self.name}] {data}")
 
-                if current_tick == -1:
-                    logging.info(f"[Federated:{self.name}] Received finalization tick -1. Shutting down.")
-                    self.active = False
-                    break
+        return data["federateId"], float(data["simStart"])
+    
 
-                if current_tick != self.last_tick:
-                    self.publish(current_tick)
-                    self.ack(current_tick)
-                    self.last_tick = current_tick
-                else:
-                    logging.debug(f"[Federated:{self.name}] Waiting for next tick...")
+    def request_time (self, fid, t_req):
+        r = requests.post(f"{self.server}/api/fed/requestTime",
+                      json={"federateId": fid, "requestTime": t_req})
+        
+        r.raise_for_status()
+        
+        logging.info(f"[Federated:{self.name}] Grant-time {r.json()['grantTime']}")
 
-                time.sleep(1)
+        return float(r.json()["grantTime"])
+    
+    @abstractmethod
+    def publish_state(self,fid, t) -> None:
+        """public a state of the node"""
+        pass    
 
-            except requests.exceptions.RequestException as e:
-                logging.error(f"[Federated:{self.name}] Request error: {e}. Assuming disconnection or timeout.")
-                break
 
-    def publish(self, tick):
-        payload = {
-            "id": self.name,
-            "time": tick,
-            "msg": f"State update at t={tick}"
-        }
-        self.client.publish("cosim/atc", json.dumps(payload))
-        logging.info(f"[Federated:{self.name}] Published: {payload}")
-
-    def ack(self, tick):
-        try:
-            r = requests.post(f"{self.server}/cosim/ack", params={"name": self.name, "tick": tick})
-            logging.info(f"[Federated:{self.name}] ACK for tick {tick}: {r.text}")
-        except requests.exceptions.RequestException as e:
-            logging.error(f"[Federated:{self.name}] ACK error: {e}")
-
-    def stop(self):
-        self.active = False
+    @abstractmethod
+    def advance_to(self,target_time) -> None:
+        """Advance BlueSky with fixed SIMDT ticks up to target_time."""
+        pass    

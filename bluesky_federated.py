@@ -1,9 +1,8 @@
 
 import logging
 
-
+        
 from federated import Federated
-import json
 
 import paho.mqtt.client as mqtt
 
@@ -14,6 +13,17 @@ from bluesky.core import Base
 from bluesky.network import subscriber
 from bluesky.network.client import Client
 from bluesky.stack import stack
+import requests
+
+from bluesky.network.server import Server
+from bluesky.network.discovery import Discovery
+from bluesky import net
+
+
+
+
+import os
+
 
 
 logging.basicConfig(level=logging.INFO)
@@ -41,68 +51,107 @@ class AircraftInfoCollector(Base):
                 'hdg': data.hdg[i] if hasattr(data, 'hdg') else 0,
                 'dest': data.dest[i] if hasattr(data, 'dest') else '',
             }
-        
-
+    
     def get_all_aircraft(self):
         return self.aircraft
 
 
 class BlueSkyFederated(Federated):
-
-   
-
-    def __init__(self, name="bluesky-federate", broker="localhost", server="http://localhost:8080"):
-        super().__init__(name=name, broker=broker, server=server)
-        self.mqtt_client = mqtt.Client(client_id=name)
-        self.mqtt_client.connect(broker, 1883, 60)
-        self.mqtt_client.loop_start()
+    def __init__(self, scenario: str, name="bluesky-federate", server="http://localhost:8080"):
+        super().__init__(name=name,server=server)
         self.bs = None
         self.collector = AircraftInfoCollector()
-        self.topic = "cosim/tracks"
+        self.scenario = scenario
 
-    def connect_to_bluesky(self):
-        bs.init(mode='client')
-        self.bs = Client()
-        self.bs.connect()
-        logger.info("Connecting to BlueSky...")
-    
+
+    def advance_to(self,target_time):
+        sim = bs.sim
+
+        # Prime: first step will switch INIT->OP if stack/traffic present
+        if sim.state == bs.INIT and (bs.traf.ntraf > 0 or len(bs.stack.get_scendata()[0]) > 0):
+            sim.step(0.0)
+            bs.net.update()  # flush once here too
+
+
+        # Step in fixed, deterministic chunks you control
+        while sim.simt + 1e-9 < target_time:
+            dt = min(self.SIMDT, target_time - sim.simt)   # don’t overshoot the grant
+            sim.step(dt)
+            bs.net.update()
    
-    def update_bluesky_track_list(self):
-        aircraft_data = self.collector.get_all_aircraft()
-        msg = json.dumps(aircraft_data, indent=4)
-        self.mqtt_client.publish(self.topic, msg)
-        logger.info(f"Published aircraft: {msg}")
+    def publish_state(self, fid, t):
+        ac = []
+        for i, acid in enumerate(bs.traf.id):
+            ac.append({
+                "id":  str(acid),
+                "lat": float(bs.traf.lat[i]),
+                "lon": float(bs.traf.lon[i]),
+                "alt": float(bs.traf.alt[i]),
+                "gs":  float(bs.traf.gs[i]),
+                "hdg": float(bs.traf.hdg[i]) if hasattr(bs.traf, 'hdg') else 0.0,
+            })
+        requests.post(
+            f"{self.server}/api/fed/trackstate",
+            json={"federateId": fid, "time": t, "tracks": ac},
+            timeout=2
+        )
+    
+    def start_network_server(self, host="localhost", port=10301):
+        """Expose BlueSky network server so GUI clients can connect."""
+        discovery = Discovery(own_id=self.name)                  # create discovery object
 
+        self.netserver = Server(discovery)
+        net.server = self.netserver
+
+         #Open the port
+        net.open(host=host, port=port)
+        logger.info(f"[Federated:{self.name}] BlueSky network server started on {host}:{port}")
+        
+        
     def run(self, timeout=None):
         logger.info("Starting BlueSky Federated node...")
-        self.connect_to_bluesky()
 
-        # Inline copy of Federated.run() so we can pump BlueSky client updates each tick. :contentReference[oaicite:5]{index=5}
-        self.register()
+        bs.init(mode='sim')           # initializes global modules
+        
+
+        bs.settings.set_variable_defaults(send_port=12001, recv_port=12000)
+        discovery = Discovery(own_id=b"SERVER", is_client=False)
+    
+        scenario_path = os.path.join(
+            os.path.dirname(__file__),   # directory of bluesky_federated.py
+            "scenarios",
+            self.scenario
+        )
+
+        
+        bs.stack.stack("IC " + scenario_path)
+
+
+        fed_id, t = self.register()
+
+        self.netserver = Server(discovery=discovery)
+
+            
         while self.active:
             try:
-                import requests
-                r = requests.get(f"{self.server}/cosim/tick", timeout=timeout)
-                response = r.json()
-                current_tick = response["time"]
+                t_req = t+ self.MACRO
+                t_grant = self.request_time(fed_id, t_req)
 
-                if current_tick == -1:
-                    logger.info(f"[Federated:{self.name}] Received finalization tick -1. Shutting down.")
-                    self.active = False
-                    break
-                else:
-                    logger.info(f"[Update the server to get new information")
-                    self.bs.update()
+                # Step BS up to the granted time
+                self.advance_to(t_grant)
 
-                    self.update_bluesky_track_list()
+                self.publish_state(fed_id, t_grant)
 
-                    if current_tick != self.last_tick:
-                        self.publish(current_tick)
-                        self.ack(current_tick)
-                        self.last_tick = current_tick
-                    else:
-                        logging.debug(f"[Federated:{self.name}] Waiting for next tick...")
-            
+
+                # >>> IMPORTANT: flush network so server/GUI see updates
+                try:
+                    bs.net.update()
+                except Exception:
+                    pass
+
+                t = t_grant
+
+
             except requests.exceptions.RequestException as e:
                 logging.error(f"[Federated:{self.name}] Request error: {e}. Assuming disconnection or timeout.")
                 break
